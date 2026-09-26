@@ -1,0 +1,7 @@
+{
+  "listen": { "host": "127.0.0.1", "port": 7580 },
+  "origin": "http://127.0.0.1:7580",
+  "db": "data/munin.dev.db",
+  "web": "web",
+  "auth": { "mode": "dev" }
+}

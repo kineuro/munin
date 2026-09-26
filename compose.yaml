@@ -1,0 +1,9 @@
+# One container; the database, the configuration and the client secret live in ./data.
+services:
+  munin:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data

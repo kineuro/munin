@@ -1,0 +1,8 @@
+{
+  "timeline": { "slug": "demo", "title": "A made-up project", "summary": "Every name and number here is invented." },
+  "sources": [
+    { "kind": "adr", "dir": "decisions", "deciders": ["Alex"] },
+    { "kind": "studies", "dir": "studies", "recordKey": "record" },
+    { "kind": "entries", "file": "hand.json" }
+  ]
+}

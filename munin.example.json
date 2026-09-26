@@ -1,0 +1,18 @@
+{
+  "listen": { "host": "0.0.0.0", "port": 8080 },
+  "origin": "https://munin.example.org",
+  "db": "munin.db",
+  "web": "/app/web",
+  "sessionDays": 14,
+  "auth": {
+    "mode": "oidc",
+    "issuer": "https://auth.example.org/application/o/munin/",
+    "clientId": "munin",
+    "clientSecretFile": "client-secret",
+    "scopes": ["openid", "email", "profile"],
+    "groupsClaim": "groups",
+    "adminGroup": "admin",
+    "allowGroups": [],
+    "createGroups": "all"
+  }
+}

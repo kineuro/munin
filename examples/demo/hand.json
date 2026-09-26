@@ -1,0 +1,14 @@
+{
+  "picture": { "now": "Two decisions made; the server is next.", "next": "Backups.", "waiting": "Alex, on where backups go." },
+  "entries": [
+    {
+      "key": "start-time",
+      "type": "result",
+      "title": "Start time, before and after",
+      "date": "2026-03-02",
+      "summary": "From nothing to answering.",
+      "fields": { "metrics": [{ "label": "After", "value": 1.4, "unit": "s" }], "chart": { "title": "Start time", "unit": "s", "bars": [{ "label": "Before", "value": 118 }, { "label": "After", "value": 1.4 }] } },
+      "links": [{ "to": "record:1", "kind": "answers" }]
+    }
+  ]
+}

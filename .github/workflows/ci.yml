@@ -1,0 +1,35 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  munin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: SPDX headers on every source file
+        run: |
+          bad=0
+          for f in $(git ls-files 'src/*.ts' 'src/**/*.ts' 'test/*.ts' 'web/*.js' 'web/*.css'); do
+            head -3 "$f" | grep -q 'SPDX-License-Identifier: AGPL-3.0-only' || { echo "no SPDX header: $f"; bad=1; }
+          done
+          exit $bad
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+      - name: the demo imports twice and changes nothing the second time
+        run: |
+          mkdir -p data
+          node dist/main.js import --config munin.dev.json --manifest examples/demo/sources.json > first.json
+          node dist/main.js import --config munin.dev.json --manifest examples/demo/sources.json > second.json
+          node -e 'const a=require("./first.json"),b=require("./second.json"); if(a.created<1||b.created!==0||b.updated!==0) process.exit(1)'
+      - name: the image builds
+        run: docker build -t munin:ci .

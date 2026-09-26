@@ -1,0 +1,33 @@
+{
+  "name": "munin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Project timelines with threaded comments: where a project started, what was decided and why, what was done and what it gave",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "munin": "dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js serve",
+    "test": "vitest run",
+    "check": "tsc -p tsconfig.json --noEmit && biome check ."
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.1",
+    "better-sqlite3": "^12.11.1",
+    "hono": "^4.13.9",
+    "jose": "^6.2.12"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.14",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.20.4",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.2"
+  }
+}

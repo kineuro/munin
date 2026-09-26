@@ -1,0 +1,19 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.14/schema.json",
+  "files": { "includes": ["src/**", "test/**", "web/**/*.js", "web/**/*.css"] },
+  "formatter": { "indentStyle": "space", "indentWidth": 2, "lineWidth": 110 },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      // short handlers such as onclick: () => ((x = y), draw()) read better in the page than blocks
+      "suspicious": { "noAssignInExpressions": "off" },
+      // the stylesheet is ordered by component, as the other kineuro sites' are, not by specificity
+      "style": { "noDescendingSpecificity": "off" },
+      // [hidden] must beat any display a component sets
+      "complexity": { "noCommaOperator": "off", "noImportantStyles": "off" }
+    }
+  },
+  "css": { "formatter": { "enabled": false } },
+  "javascript": { "formatter": { "quoteStyle": "double", "semicolons": "always" } }
+}
