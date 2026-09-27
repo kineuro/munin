@@ -191,6 +191,52 @@ describe("api", () => {
       expect((await call(ben, "POST", `/api/timelines/${slug}/entries`, b)).status).toBe(400);
   });
 
+  it("hands the entries a week at a time, newest first, with filters and links that reach older weeks", async () => {
+    const ben = await signIn("ben");
+    const { slug } = await (await call(ben, "POST", "/api/timelines", { title: "Weeks" })).json();
+    const add = async (date: string, type: string, title: string, tags: string[] = []) =>
+      (await (await call(ben, "POST", `/api/timelines/${slug}/entries`, { type, date, title, tags })).json())
+        .id as number;
+    // 2026-09-21 is a Monday: two in that week, one the week before, one a month before
+    const a = await add("2026-09-22", "action", "Newest");
+    await add("2026-09-21", "decision", "Monday", ["record 40"]);
+    await add("2026-09-16", "result", "Week before");
+    const old = await add("2026-08-12", "finding", "A month back", ["record 40"]);
+    await call(ben, "POST", `/api/entries/${old}/links`, { to: a, kind: "led_to" });
+    const get = async (qs: string) => (await call(ben, "GET", `/api/timelines/${slug}/entries${qs}`)).json();
+
+    let p = await get("");
+    expect(p.entries.map((e: { title: string }) => e.title)).toEqual(["Newest", "Monday"]);
+    expect(p).toMatchObject({ next: "2026-09-21", matched: 4 });
+    p = await get(`?before=${p.next}`);
+    expect(p.entries.map((e: { title: string }) => e.title)).toEqual(["Week before"]);
+    p = await get(`?before=${p.next}`);
+    expect(p).toMatchObject({ next: null });
+    expect(p.entries[0].title).toBe("A month back");
+
+    // a link to an old entry loads down to its week in one answer
+    p = await get(`?until=${old}`);
+    expect(p.entries).toHaveLength(4);
+    expect(p.until).toMatchObject({ found: true, date: "2026-08-12" });
+    // filters apply on the server, and say when the linked entry does not pass them
+    p = await get("?types=decision,finding&record=record%2040");
+    expect(p.entries.map((e: { title: string }) => e.title)).toEqual(["Monday"]);
+    expect(p.matched).toBe(2);
+    p = await get(`?types=action&until=${old}`);
+    expect(p.until.found).toBe(false);
+    p = await get("?q=month");
+    expect(p.entries.map((e: { title: string }) => e.title)).toEqual(["A month back"]);
+    p = await get("?through=2026-09-14");
+    expect(p.entries).toHaveLength(3);
+
+    const tl = await (await call(ben, "GET", `/api/timelines/${slug}?entries=none`)).json();
+    expect(tl.entries).toBeUndefined();
+    expect(tl.stats).toMatchObject({ total: 4, tags: ["record 40"] });
+    expect(tl.linked.map((x: { id: number }) => x.id).sort()).toEqual([a, old].sort());
+    expect((await get("?brief=1")).entries).toHaveLength(4);
+    expect((await call(ben, "GET", `/api/timelines/${slug}/entries?before=soon`)).status).toBe(400);
+  });
+
   it("serves the page for any path that is not a door", async () => {
     const r = await app.request("/t/anything");
     expect(r.status).toBe(200);

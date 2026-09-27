@@ -226,25 +226,27 @@ export function createApp(db: DB, cfg: Config): Hono<Env> {
     return c.json({ slug }, 201);
   });
 
+  // The timeline, its big picture, its links and what the page needs to filter it. With ?entries=none the entries
+  // are left out, and the page fetches them a week at a time from the door below.
   app.get("/api/timelines/:slug", (c) => {
     const who = signedIn(c);
     const { t, access } = timeline(c.req.param("slug"), who, "view");
-    const entries = db
-      .prepare("SELECT * FROM entries WHERE timeline_id = ? ORDER BY date, id")
-      .all(t.id) as EntryRow[];
-    const counts = new Map<number, { n: number; open: number }>();
-    for (const r of db
-      .prepare(
-        `SELECT c.entry_id id, COUNT(*) n, SUM(CASE WHEN c.parent_id IS NULL AND c.resolved_at IS NULL THEN 1 ELSE 0 END) open
-         FROM comments c JOIN entries e ON e.id = c.entry_id WHERE e.timeline_id = ? AND c.deleted = 0 GROUP BY c.entry_id`,
-      )
-      .all(t.id) as { id: number; n: number; open: number }[])
-      counts.set(r.id, { n: r.n, open: r.open });
+    const withEntries = c.req.query("entries") !== "none";
+    const entries = withEntries
+      ? (db.prepare("SELECT * FROM entries WHERE timeline_id = ? ORDER BY date, id").all(t.id) as EntryRow[])
+      : [];
+    const counts = commentCounts(t.id);
     const links = db
       .prepare(
         "SELECT l.id, l.from_id, l.to_id, l.kind, l.imported FROM links l JOIN entries e ON e.id = l.from_id WHERE e.timeline_id = ?",
       )
       .all(t.id);
+    const linked = db
+      .prepare(
+        `SELECT id, type, title, date, stale FROM entries WHERE timeline_id = ? AND id IN
+         (SELECT from_id FROM links UNION SELECT to_id FROM links)`,
+      )
+      .all(t.id) as { id: number; type: string; title: string; date: string; stale: number }[];
     const last = db.prepare("SELECT * FROM imports WHERE timeline_id = ? ORDER BY id DESC LIMIT 1").get(t.id);
     const mention = mentionCheck();
     return c.json({
@@ -268,8 +270,101 @@ export function createApp(db: DB, cfg: Config): Hono<Env> {
         updatedAt: t.updated_at,
         lastImport: last ?? null,
       },
-      entries: entries.map((e) => entryOut(e, counts.get(e.id), false, false)),
+      stats: stats(t.id),
+      entries: withEntries ? entries.map((e) => entryOut(e, counts.get(e.id), false, false)) : undefined,
       links,
+      linked: linked.map((r) => ({ ...r, stale: r.stale === 1 })),
+    });
+  });
+
+  // The entries a week at a time, newest first. The page asks for the latest week that has matching entries,
+  // then for the week before the cursor it was handed, until the cursor is null. `until` (an entry id) and
+  // `through` (a date) stretch one answer down to that entry's or that date's week, for links and reloads.
+  app.get("/api/timelines/:slug/entries", (c) => {
+    const who = signedIn(c);
+    const { t } = timeline(c.req.param("slug"), who, "view");
+    const q = (k: string) => c.req.query(k) ?? "";
+    const dateOf = (k: string) => {
+      const v = q(k);
+      if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) throw new HttpError(400, `${k} is YYYY-MM-DD`);
+      return v;
+    };
+    const where = ["e.timeline_id = ?"];
+    const args: unknown[] = [t.id];
+    if (q("brief") === "1") {
+      const rows = db
+        .prepare(
+          "SELECT id, type, title, date FROM entries e WHERE timeline_id = ? ORDER BY date DESC, id DESC",
+        )
+        .all(t.id);
+      return c.json({ entries: rows });
+    }
+    if (c.req.query("types") !== undefined) {
+      const types = q("types")
+        .split(",")
+        .filter((x) => (ENTRY_TYPES as readonly string[]).includes(x));
+      where.push(types.length ? `e.type IN (${types.map(() => "?").join(", ")})` : "0");
+      args.push(...types);
+    }
+    if (q("stale") !== "1") where.push("e.stale = 0");
+    for (const k of ["record", "tag"]) {
+      if (!q(k)) continue;
+      where.push("EXISTS (SELECT 1 FROM json_each(e.tags_json) WHERE value = ?)");
+      args.push(q(k));
+    }
+    const from = dateOf("from");
+    const to = dateOf("to");
+    if (from) where.push("e.date >= ?"), args.push(from);
+    if (to) where.push("e.date <= ?"), args.push(to);
+    if (q("threads") === "1")
+      where.push(
+        "EXISTS (SELECT 1 FROM comments c WHERE c.entry_id = e.id AND c.parent_id IS NULL AND c.resolved_at IS NULL AND c.deleted = 0)",
+      );
+    const words = q("q").trim().toLowerCase();
+    if (words) {
+      const like = `%${words.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
+      where.push(
+        `(${["title", "summary", "body_md", "fields_json", "tags_json"].map((k) => `lower(e.${k}) LIKE ? ESCAPE '\\'`).join(" OR ")})`,
+      );
+      args.push(like, like, like, like, like);
+    }
+    const W = where.join(" AND ");
+    const matched = (db.prepare(`SELECT COUNT(*) n FROM entries e WHERE ${W}`).get(...args) as { n: number })
+      .n;
+    const before = dateOf("before");
+    const top = (
+      db
+        .prepare(`SELECT MAX(date) d FROM entries e WHERE ${W}${before ? " AND e.date < ?" : ""}`)
+        .get(...args, ...(before ? [before] : [])) as { d: string | null }
+    ).d;
+    let found: { found: boolean; stale: boolean; date: string } | undefined;
+    let start = top ? weekStart(top) : null;
+    const until = Number(q("until"));
+    if (until) {
+      const u = db
+        .prepare("SELECT date, stale FROM entries WHERE id = ? AND timeline_id = ?")
+        .get(until, t.id) as { date: string; stale: number } | undefined;
+      if (u) {
+        const ok = !!db.prepare(`SELECT 1 FROM entries e WHERE ${W} AND e.id = ?`).get(...args, until);
+        found = { found: ok, stale: u.stale === 1, date: u.date };
+        if (ok && (!before || u.date < before) && (!start || u.date < start)) start = weekStart(u.date);
+      }
+    }
+    const through = dateOf("through");
+    if (through && start && (!before || through < before) && through < start) start = weekStart(through);
+    if (!start) return c.json({ entries: [], next: null, matched, until: found ?? null });
+    const rows = db
+      .prepare(
+        `SELECT e.* FROM entries e WHERE ${W} AND e.date >= ?${before ? " AND e.date < ?" : ""} ORDER BY e.date DESC, e.id DESC`,
+      )
+      .all(...args, start, ...(before ? [before] : [])) as EntryRow[];
+    const more = db.prepare(`SELECT 1 FROM entries e WHERE ${W} AND e.date < ? LIMIT 1`).get(...args, start);
+    const counts = commentCounts(t.id);
+    return c.json({
+      entries: rows.map((e) => entryOut(e, counts.get(e.id), false, false)),
+      next: more ? start : null,
+      matched,
+      until: found ?? null,
     });
   });
 
@@ -604,6 +699,54 @@ export function createApp(db: DB, cfg: Config): Hono<Env> {
     return { e, t, access };
   }
 
+  function commentCounts(timelineId: number): Map<number, { n: number; open: number }> {
+    const counts = new Map<number, { n: number; open: number }>();
+    for (const r of db
+      .prepare(
+        `SELECT c.entry_id id, COUNT(*) n, SUM(CASE WHEN c.parent_id IS NULL AND c.resolved_at IS NULL THEN 1 ELSE 0 END) open
+         FROM comments c JOIN entries e ON e.id = c.entry_id WHERE e.timeline_id = ? AND c.deleted = 0 GROUP BY c.entry_id`,
+      )
+      .all(timelineId) as { id: number; n: number; open: number }[])
+      counts.set(r.id, { n: r.n, open: r.open });
+    return counts;
+  }
+
+  /** What the page needs to offer filters without holding every entry: counts, tags and the open questions. */
+  function stats(timelineId: number) {
+    const rows = db
+      .prepare("SELECT type, COUNT(*) n FROM entries WHERE timeline_id = ? AND stale = 0 GROUP BY type")
+      .all(timelineId) as { type: string; n: number }[];
+    const tags = (
+      db
+        .prepare(
+          "SELECT DISTINCT j.value v FROM entries e, json_each(e.tags_json) j WHERE e.timeline_id = ? ORDER BY v",
+        )
+        .all(timelineId) as { v: string }[]
+    ).map((r) => r.v);
+    const stale = (
+      db.prepare("SELECT COUNT(*) n FROM entries WHERE timeline_id = ? AND stale = 1").get(timelineId) as {
+        n: number;
+      }
+    ).n;
+    const open = db
+      .prepare(
+        "SELECT id, title, date, fields_json FROM entries WHERE timeline_id = ? AND type = 'question' AND status = 'open' AND stale = 0 ORDER BY date, id",
+      )
+      .all(timelineId) as { id: number; title: string; date: string; fields_json: string }[];
+    return {
+      counts: Object.fromEntries(rows.map((r) => [r.type, r.n])),
+      total: rows.reduce((a, r) => a + r.n, 0),
+      stale,
+      tags,
+      openQuestions: open.map((r) => ({
+        id: r.id,
+        title: r.title,
+        date: r.date,
+        waitingOn: (JSON.parse(r.fields_json) as { waitingOn?: string }).waitingOn ?? "",
+      })),
+    };
+  }
+
   function userBrief(id: number) {
     const u = db.prepare("SELECT username, name FROM users WHERE id = ?").get(id) as
       | { username: string; name: string }
@@ -678,6 +821,13 @@ export function createApp(db: DB, cfg: Config): Hono<Env> {
   }
 
   return app;
+}
+
+/** The Monday that starts the ISO week of a YYYY-MM-DD date. */
+export function weekStart(date: string): string {
+  const d = new Date(`${date}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+  return d.toISOString().slice(0, 10);
 }
 
 function pick(o: Record<string, unknown>, keys: string[]): Record<string, unknown> {

@@ -8,7 +8,7 @@ A research project leaves its decisions in many places: decision records, releas
 
 ## What a timeline holds
 
-A timeline is a vertical line of typed entries, oldest first:
+A timeline is a vertical line of typed entries, newest first and grouped by week. The page opens on the latest week and loads older weeks as you scroll, so a long project opens as fast as a new one; filters are applied by the server, and a link to an old entry loads down to it:
 
 | Type | What it carries |
 |---|---|
@@ -21,9 +21,9 @@ A timeline is a vertical line of typed entries, oldest first:
 
 Entries link to each other: this finding led to that decision, this release answers that record, this record supersedes that one. The page shows each link from both ends ("Led to", "Came from").
 
-Above the line sits the big picture: where we are, what is next, and what waits on whom, with every open question listed under it.
+Above the line sits the big picture: where we are, what is next, and what waits on whom, with every open question listed under it. It opens folded to its first lines, because it is long and read once a visit; the page remembers in the browser when someone unfolds it.
 
-Every entry has threads. A comment can be answered, and a thread is resolved or reopened at its first comment. Mentions (`@username`) are recorded now so that notifications can be added later without a migration.
+Every entry has threads. Opening an entry (a click or tap anywhere on it, or Enter on its title) makes it the active one, and its threads show as a chat beside the line on a wide screen, or under the entry on a phone, with the box to write at the bottom. A comment can be answered, and a thread is resolved or reopened at its first comment. Mentions (`@username`) are recorded now so that notifications can be added later without a migration.
 
 ## Who sees what
 

@@ -27,7 +27,19 @@ const S = {
   byId: new Map(),
   links: [],
   open: new Set(),
-  bodyHits: null,
+  active: null,
+  stats: null,
+  linked: new Map(),
+  panel: null,
+  controls: null,
+  gen: 0,
+  next: null,
+  floor: null,
+  week: "",
+  lastDate: "",
+  matched: 0,
+  loading: false,
+  scrolled: false,
 };
 const main = document.getElementById("main");
 
@@ -203,6 +215,7 @@ function signin() {
 // --- the list of timelines ------------------------------------------------------------------------------------
 async function home() {
   document.title = "Munin";
+  S.tl = null;
   const { timelines } = await api("GET", "/api/timelines");
   const form = h("form", { class: "new", hidden: true });
   const err = h("p", { class: "error" });
@@ -298,6 +311,8 @@ async function home() {
 }
 
 // --- a timeline -----------------------------------------------------------------------------------------------
+// Newest first, a week at a time: the first answer is the latest week with matching entries, and older weeks
+// load as the person scrolls towards the end. Filters are applied by the server, so they reach unloaded weeks.
 const F = {
   types: new Set(TYPES.map(([k]) => k)),
   record: "",
@@ -306,14 +321,28 @@ const F = {
   to: "",
   q: "",
   threads: false,
-  newest: false,
   stale: false,
 };
+const WIDE = window.matchMedia("(min-width: 1100px)");
+WIDE.addEventListener("change", () => placePanel());
+
+function clearFilters(stale = false) {
+  Object.assign(F, {
+    types: new Set(TYPES.map(([k]) => k)),
+    record: "",
+    tag: "",
+    from: "",
+    to: "",
+    q: "",
+    threads: false,
+    stale,
+  });
+}
 
 async function timeline(slug, keepOpen) {
   let data;
   try {
-    data = await api("GET", `/api/timelines/${slug}`);
+    data = await api("GET", `/api/timelines/${slug}?entries=none`);
   } catch (e) {
     main.replaceChildren(
       h(
@@ -326,11 +355,15 @@ async function timeline(slug, keepOpen) {
     );
     return;
   }
-  if (!keepOpen || S.tl?.slug !== slug) S.open = new Set();
+  const through = keepOpen && S.tl?.slug === slug ? S.floor : null;
+  if (!keepOpen || S.tl?.slug !== slug) {
+    S.open = new Set();
+    S.active = null;
+  }
   S.tl = data.timeline;
-  S.entries = data.entries;
-  S.byId = new Map(S.entries.map((e) => [e.id, e]));
+  S.stats = data.stats;
   S.links = data.links;
+  S.linked = new Map(data.linked.map((x) => [x.id, x]));
   if (!S.dir) S.dir = await api("GET", "/api/directory").catch(() => ({ users: [], groups: [] }));
   document.title = `${S.tl.title} · Munin`;
   const t = S.tl;
@@ -359,16 +392,37 @@ async function timeline(slug, keepOpen) {
         : null,
     ),
   );
-  main.replaceChildren(head, picture(canEdit), controls(), h("div", { id: "list" }));
-  drawList();
+  S.panel = h("section", { class: "chat", "aria-label": "Threads" });
+  S.controls = controls();
+  const more = h("div", { id: "more", class: "more" });
+  main.replaceChildren(
+    head,
+    picture(canEdit),
+    S.controls,
+    h(
+      "div",
+      { class: "tl-body" },
+      h("div", { class: "tl-main" }, h("div", { id: "list" }), more),
+      h("aside", { class: "side" }),
+    ),
+  );
   const hash = /^#e(\d+)$/.exec(location.hash);
-  if (hash) openEntry(Number(hash[1]), true);
+  const id = hash ? Number(hash[1]) : null;
+  if (id) {
+    S.open.add(id);
+    S.active = id;
+  }
+  if (!(await load({ until: id, through }))) return;
+  if (S.active && !S.byId.has(S.active)) S.active = [...S.open].filter((x) => S.byId.has(x)).pop() ?? null;
+  markActive();
+  drawPanel();
+  if (id) document.getElementById(`e${id}`)?.scrollIntoView({ block: "start", behavior: "auto" });
 }
 
 function picture(canEdit) {
   const p = S.tl.picture;
-  const open = S.entries.filter((e) => e.type === "question" && e.status === "open" && !e.stale);
-  const box = h("div", { class: "picture" });
+  const open = S.stats.openQuestions;
+  const box = h("div", { class: "picture", id: "picture" });
   const sec = (title, html, extra) =>
     h(
       "section",
@@ -394,7 +448,7 @@ function picture(canEdit) {
                 { href: `#e${q.id}`, onclick: (ev) => (ev.preventDefault(), openEntry(q.id, true)) },
                 q.title,
               ),
-              q.fields.waitingOn ? h("span", { class: "muted" }, ` · waits on ${q.fields.waitingOn}`) : null,
+              q.waitingOn ? h("span", { class: "muted" }, ` · waits on ${q.waitingOn}`) : null,
             ),
           ),
         ),
@@ -405,21 +459,49 @@ function picture(canEdit) {
     sec("What is next", p.nextHtml),
     sec("Waiting on", p.waitingHtml, qlist),
   );
-  if (!canEdit) return box;
-  const wrap = h("div", {}, box);
-  box.append();
-  const edit = h(
-    "button",
-    { class: "linkish", style: "margin:-10px 0 14px", onclick: () => editPicture() },
-    "Edit the big picture",
+  // Collapsed to its first lines until the person asks for more; the choice is remembered in this browser.
+  const key = `munin-picture:${S.tl.slug}`;
+  let expanded = false;
+  try {
+    expanded = localStorage.getItem(key) === "open";
+  } catch {}
+  const btn = h("button", { class: "linkish", type: "button", "aria-controls": "picture" });
+  const note = h("span", { class: "muted" });
+  const set = (v) => {
+    expanded = v;
+    box.classList.toggle("collapsed", !v);
+    btn.textContent = v ? "Show less" : "Show more of the big picture";
+    btn.setAttribute("aria-expanded", String(v));
+    note.textContent =
+      !v && open.length ? `${open.length} open question${open.length > 1 ? "s" : ""} waiting` : "";
+    try {
+      if (v) localStorage.setItem(key, "open");
+      else localStorage.removeItem(key);
+    } catch {}
+  };
+  btn.addEventListener("click", () => set(!expanded));
+  box.addEventListener("click", (ev) => {
+    if (!expanded && !ev.target.closest("a, button")) set(true);
+  });
+  set(expanded);
+  return h(
+    "div",
+    { class: "picture-wrap" },
+    box,
+    h(
+      "div",
+      { class: "picture-tools" },
+      btn,
+      note,
+      canEdit
+        ? h("button", { class: "linkish", onclick: () => editPicture() }, "Edit the big picture")
+        : null,
+    ),
   );
-  wrap.append(edit);
-  return wrap;
 }
 
 function controls() {
-  const counts = {};
-  for (const e of S.entries) if (!e.stale) counts[e.type] = (counts[e.type] || 0) + 1;
+  const counts = S.stats.counts;
   const chips = h(
     "div",
     { class: "stats", role: "group", "aria-label": "Show types" },
@@ -437,7 +519,7 @@ function controls() {
             else F.types.add(k);
             for (const b of chips.children)
               b.setAttribute("aria-pressed", String(F.types.has(b.dataset.type)));
-            drawList();
+            load();
           },
           "data-type": k,
           title: "Click to show or hide; shift-click to show only this",
@@ -448,10 +530,10 @@ function controls() {
       ),
     ),
   );
-  const records = [...new Set(S.entries.flatMap((e) => e.tags).filter((t) => /^record \d+$/.test(t)))].sort(
-    (a, b) => Number(a.slice(7)) - Number(b.slice(7)),
-  );
-  const tags = [...new Set(S.entries.flatMap((e) => e.tags).filter((t) => !/^record \d+$/.test(t)))].sort();
+  const records = S.stats.tags
+    .filter((t) => /^record \d+$/.test(t))
+    .sort((a, b) => Number(a.slice(7)) - Number(b.slice(7)));
+  const tags = S.stats.tags.filter((t) => !/^record \d+$/.test(t));
   const sel = (name, label, opts, all) =>
     h(
       "label",
@@ -459,7 +541,7 @@ function controls() {
       label,
       h(
         "select",
-        { onchange: (ev) => ((F[name] = ev.target.value), drawList()) },
+        { onchange: (ev) => ((F[name] = ev.target.value), load()) },
         h("option", { value: "" }, all),
         opts.map((o) => h("option", { value: o, selected: F[name] === o }, o)),
       ),
@@ -468,21 +550,11 @@ function controls() {
   const q = h("input", {
     type: "search",
     value: F.q,
-    placeholder: "Words in titles, texts and threads' entries",
+    placeholder: "Words in titles, summaries and texts",
     oninput: (ev) => {
       F.q = ev.target.value;
       clearTimeout(timer);
-      drawList();
-      timer = setTimeout(async () => {
-        if (F.q.trim().length >= 3) {
-          const r = await api(
-            "GET",
-            `/api/timelines/${S.tl.slug}/search?q=${encodeURIComponent(F.q.trim())}`,
-          ).catch(() => ({ ids: [] }));
-          S.bodyHits = new Set(r.ids);
-        } else S.bodyHits = null;
-        drawList();
-      }, 250);
+      timer = setTimeout(() => load(), 250);
     },
   });
   const filters = h(
@@ -495,13 +567,13 @@ function controls() {
       "label",
       {},
       "From",
-      h("input", { type: "date", value: F.from, onchange: (ev) => ((F.from = ev.target.value), drawList()) }),
+      h("input", { type: "date", value: F.from, onchange: (ev) => ((F.from = ev.target.value), load()) }),
     ),
     h(
       "label",
       {},
       "To",
-      h("input", { type: "date", value: F.to, onchange: (ev) => ((F.to = ev.target.value), drawList()) }),
+      h("input", { type: "date", value: F.to, onchange: (ev) => ((F.to = ev.target.value), load()) }),
     ),
     h(
       "button",
@@ -509,18 +581,9 @@ function controls() {
         class: "button ghost small",
         type: "button",
         onclick: () => {
-          Object.assign(F, {
-            types: new Set(TYPES.map(([k]) => k)),
-            record: "",
-            tag: "",
-            from: "",
-            to: "",
-            q: "",
-            threads: false,
-            stale: false,
-          });
-          S.bodyHits = null;
-          timeline(S.tl.slug, true);
+          clearFilters();
+          redrawControls();
+          load();
         },
       },
       "Clear",
@@ -536,86 +599,185 @@ function controls() {
       h("input", {
         type: "checkbox",
         checked: F.threads,
-        onchange: (ev) => ((F.threads = ev.target.checked), drawList()),
+        onchange: (ev) => ((F.threads = ev.target.checked), load()),
       }),
       "Open threads only",
     ),
-    h(
-      "label",
-      {},
-      h("input", {
-        type: "checkbox",
-        checked: F.newest,
-        onchange: (ev) => ((F.newest = ev.target.checked), drawList()),
-      }),
-      "Newest first",
-    ),
-    S.entries.some((e) => e.stale)
+    S.stats.stale
       ? h(
           "label",
           {},
           h("input", {
             type: "checkbox",
             checked: F.stale,
-            onchange: (ev) => ((F.stale = ev.target.checked), drawList()),
+            onchange: (ev) => ((F.stale = ev.target.checked), load()),
           }),
           "Entries gone from their source",
         )
       : null,
   );
-  return h("div", {}, chips, filters, toggles);
+  return h("div", { class: "controls" }, chips, filters, toggles);
 }
 
-function matches(e) {
-  if (!F.types.has(e.type)) return false;
-  if (e.stale && !F.stale) return false;
-  if (F.record && !e.tags.includes(F.record)) return false;
-  if (F.tag && !e.tags.includes(F.tag)) return false;
-  if (F.from && e.date < F.from) return false;
-  if (F.to && e.date > F.to) return false;
-  if (F.threads && !e.openThreads) return false;
-  const q = F.q.trim().toLowerCase();
-  if (q) {
-    const hay = `${e.title}\n${e.summary}\n${e.tags.join(" ")}\n${JSON.stringify(e.fields)}`.toLowerCase();
-    if (!hay.includes(q) && !S.bodyHits?.has(e.id)) return false;
+function redrawControls() {
+  const fresh = controls();
+  S.controls?.replaceWith(fresh);
+  S.controls = fresh;
+}
+
+function page(extra = {}) {
+  const p = new URLSearchParams();
+  if (F.types.size !== TYPES.length) p.set("types", [...F.types].join(","));
+  for (const k of ["record", "tag", "from", "to"]) if (F[k]) p.set(k, F[k]);
+  if (F.q.trim()) p.set("q", F.q.trim());
+  if (F.threads) p.set("threads", "1");
+  if (F.stale) p.set("stale", "1");
+  for (const [k, v] of Object.entries(extra)) if (v) p.set(k, String(v));
+  return api("GET", `/api/timelines/${S.tl.slug}/entries?${p}`);
+}
+
+/** Loads the list afresh: the latest week, or down to an entry (`until`) or a date (`through`). */
+async function load({ until = null, through = null } = {}) {
+  const gen = ++S.gen;
+  const list = document.getElementById("list");
+  if (!list) return false;
+  let r;
+  try {
+    r = await page({ until, through });
+    if (gen !== S.gen) return false;
+    if (until && r.until && !r.until.found) {
+      // The linked entry is hidden by the filters: clear them rather than show a page without it.
+      clearFilters(r.until.stale);
+      redrawControls();
+      r = await page({ until, through });
+      if (gen !== S.gen) return false;
+    }
+  } catch (e) {
+    if (gen === S.gen) list.replaceChildren(h("p", { class: "error pad" }, e.message));
+    return false;
   }
+  S.entries = [];
+  S.byId = new Map();
+  S.week = "";
+  S.lastDate = "";
+  S.floor = null;
+  S.matched = r.matched;
+  S.scrolled = false;
+  list.replaceChildren(h("div", { class: "rail" }));
+  append(r);
   return true;
 }
 
-function drawList() {
-  const list = document.getElementById("list");
-  if (!list) return;
-  let shown = S.entries.filter(matches);
-  if (F.newest) shown = [...shown].reverse();
-  document.getElementById("shown-n").textContent =
-    `${shown.length} of ${S.entries.filter((e) => !e.stale).length} entries`;
-  const rail = h("div", { class: "rail" });
-  let period = "";
-  let lastDate = "";
-  for (const e of shown) {
-    const p = e.date.slice(0, 7);
-    if (p !== period) {
-      period = p;
-      const [y, m] = p.split("-").map(Number);
-      rail.append(
-        h("div", { class: "period" }, h("h2", {}, MONTHS[m - 1]), h("div", { class: "era" }, String(y))),
-      );
-      lastDate = "";
-    }
-    rail.append(entryEl(e, e.date !== lastDate));
-    lastDate = e.date;
+async function loadMore() {
+  if (!S.next || S.loading) return;
+  S.loading = true;
+  const gen = S.gen;
+  drawMore();
+  try {
+    const r = await page({ before: S.next });
+    if (gen === S.gen) append(r);
+  } catch (e) {
+    if (gen === S.gen)
+      document.getElementById("more")?.replaceChildren(h("p", { class: "error" }, e.message));
+    return;
+  } finally {
+    S.loading = false;
   }
-  if (!shown.length)
-    rail.append(
-      h("p", { class: "muted pad" }, S.entries.length ? "Nothing matches these filters." : "No entries yet."),
-    );
-  list.replaceChildren(rail);
+  if (gen !== S.gen) return;
+  drawMore();
+  if (nearEnd()) loadMore();
 }
 
-function entryEl(e, showDate) {
-  const el = h("article", { class: `entry ${e.type}${S.open.has(e.id) ? " open" : ""}`, id: `e${e.id}` });
-  const day = Number(e.date.slice(8));
-  const meta = h(
+function append(r) {
+  const rail = document.querySelector("#list .rail");
+  if (!rail) return;
+  for (const e of r.entries) {
+    S.entries.push(e);
+    S.byId.set(e.id, e);
+    const w = weekOf(e.date);
+    if (w.start !== S.week) {
+      S.week = w.start;
+      S.lastDate = "";
+      rail.append(weekEl(w));
+    }
+    rail.append(entryEl(e, e.date !== S.lastDate));
+    S.lastDate = e.date;
+  }
+  S.next = r.next;
+  if (S.entries.length) S.floor = weekOf(S.entries[S.entries.length - 1].date).start;
+  else
+    rail.append(
+      h(
+        "p",
+        { class: "muted pad" },
+        S.stats.total + S.stats.stale ? "Nothing matches these filters." : "No entries yet.",
+      ),
+    );
+  const n = document.getElementById("shown-n");
+  if (n) n.textContent = `${S.matched} of ${S.stats.total} entries`;
+  drawMore();
+}
+
+function drawMore() {
+  const more = document.getElementById("more");
+  if (!more) return;
+  if (S.loading) more.replaceChildren(h("p", { class: "muted" }, "Loading older weeks…"));
+  else if (S.next)
+    more.replaceChildren(
+      h("button", { class: "button ghost small", type: "button", onclick: () => loadMore() }, "Older weeks"),
+    );
+  else more.replaceChildren(S.entries.length ? h("p", { class: "muted" }, "The start of the timeline.") : "");
+}
+
+// Older weeks load when the person scrolls (or wheels, or swipes) near the end of what is loaded.
+function nearEnd() {
+  const more = document.getElementById("more");
+  return !!more && S.scrolled && more.getBoundingClientRect().top < window.innerHeight + 400;
+}
+let scrollTick = false;
+function onScroll() {
+  if (!S.tl || scrollTick) return;
+  scrollTick = true;
+  requestAnimationFrame(() => {
+    scrollTick = false;
+    S.scrolled = true;
+    if (S.next && !S.loading && nearEnd()) loadMore();
+  });
+}
+for (const ev of ["scroll", "wheel", "touchmove"]) window.addEventListener(ev, onScroll, { passive: true });
+window.addEventListener("hashchange", () => {
+  const m = /^#e(\d+)$/.exec(location.hash);
+  if (m && S.tl && /^\/t\//.test(location.pathname)) openEntry(Number(m[1]), true);
+});
+
+function iso(d) {
+  return d.toISOString().slice(0, 10);
+}
+/** The ISO week of a date: its Monday, its Sunday and its number. */
+function weekOf(date) {
+  const d = new Date(`${date}T00:00:00Z`);
+  const start = new Date(d);
+  start.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+  const end = new Date(start);
+  end.setUTCDate(start.getUTCDate() + 6);
+  const thu = new Date(start);
+  thu.setUTCDate(start.getUTCDate() + 3);
+  const y = thu.getUTCFullYear();
+  const n = 1 + Math.floor((thu - Date.UTC(y, 0, 1)) / 86400000 / 7);
+  return { start: iso(start), end: iso(end), n, y };
+}
+function weekEl(w) {
+  const [, m1, d1] = w.start.split("-").map(Number);
+  const [y2, m2, d2] = w.end.split("-").map(Number);
+  const range =
+    m1 === m2
+      ? `${d1} to ${d2} ${MONTHS[m2 - 1]} ${y2}`
+      : `${d1} ${MONTHS[m1 - 1]} to ${d2} ${MONTHS[m2 - 1]} ${y2}`;
+  return h("div", { class: "period" }, h("h2", {}, `Week ${w.n}`), h("div", { class: "era" }, range));
+}
+
+function metaEl(e) {
+  return h(
     "div",
     { class: "meta" },
     e.fields.decidedBy && e.type === "decision"
@@ -645,6 +807,15 @@ function entryEl(e, showDate) {
       .slice(0, 4)
       .map((t) => h("span", { class: "tag" }, t)),
   );
+}
+
+function entryEl(e, showDate) {
+  const open = S.open.has(e.id);
+  const el = h("article", {
+    class: `entry ${e.type}${open ? " open" : ""}${open && S.active === e.id ? " active" : ""}`,
+    id: `e${e.id}`,
+  });
+  const day = Number(e.date.slice(8));
   el.append(
     ...[
       mk(e.type),
@@ -655,22 +826,31 @@ function entryEl(e, showDate) {
         "div",
         { class: "line" },
         h("span", { class: "typename" }, TYPE_NAME[e.type]),
+        // The title stays the one keyboard stop for the entry (Enter and Space open it); the rest of the card
+        // answers pointer clicks and taps the same way.
         h(
           "button",
           {
             class: "title",
             type: "button",
-            "aria-expanded": String(S.open.has(e.id)),
+            "aria-expanded": String(open),
             onclick: () => toggle(e.id),
           },
           e.title,
         ),
       ),
       e.summary ? h("p", { class: "summary" }, e.summary) : null,
-      meta,
+      metaEl(e),
     ].filter(Boolean),
   );
-  if (S.open.has(e.id)) {
+  el.addEventListener("click", (ev) => {
+    if (ev.target.closest("a, button, input, select, textarea, label, summary, details, form, dialog, svg"))
+      return;
+    if (String(window.getSelection?.() || "").length) return; // selecting text is not a click
+    if (ev.target.closest(".detail")) return setActive(e.id);
+    toggle(e.id);
+  });
+  if (open) {
     const d = h("div", { class: "detail" }, h("p", { class: "muted" }, "Loading…"));
     el.append(d);
     fillDetail(e.id, d);
@@ -679,37 +859,48 @@ function entryEl(e, showDate) {
 }
 
 function toggle(id) {
-  if (S.open.has(id)) S.open.delete(id);
-  else S.open.add(id);
+  const was = S.active;
+  if (S.open.has(id)) {
+    S.open.delete(id);
+    if (S.active === id) S.active = [...S.open].pop() ?? null;
+  } else {
+    S.open.add(id);
+    S.active = id;
+  }
   const e = S.byId.get(id);
   const old = document.getElementById(`e${id}`);
-  const prevDate = old?.querySelector(".when");
-  if (old) old.replaceWith(entryEl(e, !!prevDate));
+  if (old && e) {
+    const focused = old.contains(document.activeElement);
+    const fresh = entryEl(e, !!old.querySelector(".when"));
+    old.replaceWith(fresh);
+    if (focused) fresh.querySelector(".title")?.focus();
+  }
   if (S.open.has(id)) history.replaceState(null, "", `#e${id}`);
+  else if (location.hash === `#e${id}`) history.replaceState(null, "", location.pathname + location.search);
+  if (S.active !== was) {
+    markActive();
+    drawPanel();
+  }
 }
 
-function openEntry(id, scroll) {
-  const e = S.byId.get(id);
-  if (!e) return;
-  if (!matches(e)) {
-    Object.assign(F, {
-      types: new Set(TYPES.map(([k]) => k)),
-      record: "",
-      tag: "",
-      from: "",
-      to: "",
-      q: "",
-      threads: false,
-      stale: e.stale,
-    });
-    S.bodyHits = null;
-    S.open.add(id);
-    timeline(S.tl.slug, true).then(() =>
-      document.getElementById(`e${id}`)?.scrollIntoView({ block: "start", behavior: "auto" }),
-    );
-    return;
-  }
+function setActive(id) {
+  if (S.active === id || !S.open.has(id)) return;
+  S.active = id;
+  history.replaceState(null, "", `#e${id}`);
+  markActive();
+  drawPanel();
+}
+
+function markActive() {
+  for (const el of document.querySelectorAll(".entry.active")) el.classList.remove("active");
+  if (S.active) document.getElementById(`e${S.active}`)?.classList.add("active");
+}
+
+async function openEntry(id, scroll) {
+  if (!S.byId.has(id) && !(await load({ until: id }))) return;
+  if (!S.byId.has(id)) return;
   if (!S.open.has(id)) toggle(id);
+  else setActive(id);
   if (scroll) document.getElementById(`e${id}`)?.scrollIntoView({ block: "start", behavior: "auto" });
 }
 
@@ -855,24 +1046,25 @@ async function fillDetail(id, box) {
           href: `#e${e.id}`,
           onclick: (ev) => (
             ev.preventDefault(),
-            navigator.clipboard?.writeText(`${location.origin}${location.pathname}#e${e.id}`)
+            navigator.clipboard?.writeText(`${location.origin}${location.pathname}#e${e.id}`)?.catch(() => {})
           ),
         },
         "Copy link",
       ),
     ),
   );
-  const threads = h("div", { class: "thread-box" });
-  kids.push(threads);
+  kids.push(h("div", { class: "thread-slot" }));
   box.replaceChildren(...kids);
-  drawThreads(id, threads);
+  if (S.active === id) placePanel();
 }
 
 function relations(id) {
   const rows = [];
   for (const l of S.links) {
-    if (l.from_id === id && S.byId.has(l.to_id)) rows.push([LINK_WORDS[l.kind][0], S.byId.get(l.to_id), l]);
-    if (l.to_id === id && S.byId.has(l.from_id)) rows.push([LINK_WORDS[l.kind][1], S.byId.get(l.from_id), l]);
+    if (l.from_id === id && S.linked.has(l.to_id))
+      rows.push([LINK_WORDS[l.kind][0], S.linked.get(l.to_id), l]);
+    if (l.to_id === id && S.linked.has(l.from_id))
+      rows.push([LINK_WORDS[l.kind][1], S.linked.get(l.from_id), l]);
   }
   if (!rows.length) return null;
   rows.sort((a, b) => a[1].date.localeCompare(b[1].date));
@@ -987,157 +1179,228 @@ function chart(c) {
 }
 
 // --- threads --------------------------------------------------------------------------------------------------
-async function drawThreads(entryId, box) {
+// The threads of the active entry, as a chat: a pane beside the timeline on wide screens, under the entry on
+// narrow ones. Each thread is its first comment with its replies indented under it; the box to write sits last.
+function drawPanel() {
+  const id = S.active;
+  const e = id ? S.byId.get(id) : null;
+  if (!S.panel) return;
+  if (!e) {
+    S.panel.replaceChildren(
+      h(
+        "div",
+        { class: "chat-empty" },
+        h("h3", {}, "Threads"),
+        h("p", { class: "muted" }, "Open an entry to read its threads and write in them."),
+      ),
+    );
+    placePanel();
+    return;
+  }
+  const log = h("div", { class: "chat-log", role: "log" }, h("p", { class: "muted" }, "Loading…"));
+  const foot = h("div", { class: "chat-foot" });
+  S.panel.replaceChildren(
+    h(
+      "div",
+      { class: `chat-head ${e.type}` },
+      mk(e.type),
+      h(
+        "div",
+        {},
+        h("span", { class: "typename" }, `Threads on this ${TYPE_NAME[e.type].toLowerCase()}`),
+        h(
+          "a",
+          {
+            href: `#e${e.id}`,
+            onclick: (ev) => (
+              ev.preventDefault(),
+              document.getElementById(`e${e.id}`)?.scrollIntoView({ block: "start", behavior: "smooth" })
+            ),
+          },
+          e.title,
+        ),
+      ),
+    ),
+    log,
+    foot,
+  );
+  placePanel();
+  drawThreads({ entryId: id, log, foot });
+}
+
+function placePanel() {
+  const side = document.querySelector(".side");
+  if (!S.panel || !side) return;
+  const slot = S.active ? document.querySelector(`#e${S.active} .thread-slot`) : null;
+  const home = WIDE.matches || !slot ? side : slot;
+  if (S.panel.parentNode !== home) home.append(S.panel);
+}
+
+async function drawThreads(ctx) {
+  const { entryId, log, foot } = ctx;
   let data;
   try {
     data = await api("GET", `/api/entries/${entryId}/comments`);
   } catch (e) {
-    box.replaceChildren(h("p", { class: "error" }, e.message));
+    log.replaceChildren(h("p", { class: "error" }, e.message));
     return;
   }
+  if (S.active !== entryId || !log.isConnected) return;
+  ctx.may = data.mayComment;
   const tops = data.comments.filter((c) => !c.parentId);
-  const kids = [h("h4", {}, tops.length ? `Threads (${tops.length})` : "Threads")];
+  const kids = [];
   for (const t of tops) {
     const replies = data.comments.filter((c) => c.parentId === t.id);
     const th = h("div", { class: `thread${t.resolvedAt ? " resolved" : ""}` });
     const body = () => {
-      th.replaceChildren(commentEl(t, entryId, box, data.mayComment, true));
+      th.replaceChildren(bubble(t, ctx, true));
       if (replies.length)
         th.append(
           h(
             "div",
             { class: "replies" },
-            replies.map((r) => commentEl(r, entryId, box, data.mayComment, false)),
+            replies.map((r) => bubble(r, ctx, false)),
           ),
         );
-      if (data.mayComment && !t.resolvedAt) th.append(replyButton(entryId, t.id, box));
+      if (ctx.may && !t.resolvedAt) th.append(replyButton(ctx, t.id));
     };
     if (t.resolvedAt) {
       th.append(
         h(
           "p",
-          { class: "muted", style: "font-size:13px" },
+          { class: "muted resolved-line" },
           `${t.author.name}: resolved by ${t.resolvedBy || "someone"} ${ago(t.resolvedAt)} (${replies.length + 1} comment${replies.length ? "s" : ""}) `,
-          h("button", { class: "linkish", onclick: body }, "Show"),
+          h("button", { class: "linkish", type: "button", onclick: body }, "Show"),
         ),
       );
     } else body();
     kids.push(th);
   }
-  if (data.mayComment) kids.push(composer(entryId, null, box, "Start a thread"));
-  else if (!tops.length)
+  if (!tops.length)
     kids.push(
       h(
         "p",
-        { class: "muted", style: "font-size:13px" },
-        "No threads. You may read this timeline, not comment on it.",
+        { class: "muted chat-none" },
+        ctx.may
+          ? "No threads yet. Start one below."
+          : "No threads. You may read this timeline, not comment on it.",
       ),
     );
-  box.replaceChildren(...kids);
+  log.replaceChildren(...kids);
+  foot.replaceChildren(ctx.may ? composer(ctx, null, "Send") : "");
+  foot.hidden = !ctx.may;
+  if (WIDE.matches) log.scrollTop = log.scrollHeight;
 }
 
-function commentEl(c, entryId, box, may, top) {
-  const el = h("div", { class: "comment" });
-  const redraw = () => drawThreads(entryId, box).then(() => refreshCounts());
+function bubble(c, ctx, top) {
+  const el = h("div", { class: `bubble${c.mine ? " mine" : ""}` });
+  const redraw = () => drawThreads(ctx).then(() => refreshCounts(ctx.entryId));
+  const acts = h(
+    "div",
+    { class: "acts" },
+    ctx.may && top && !c.deleted
+      ? h(
+          "button",
+          {
+            class: "linkish",
+            type: "button",
+            onclick: async () => (
+              await api("PATCH", `/api/comments/${c.id}`, { resolved: !c.resolvedAt }), redraw()
+            ),
+          },
+          c.resolvedAt ? "Reopen" : "Resolve",
+        )
+      : null,
+    c.mine && !c.deleted
+      ? h(
+          "button",
+          { class: "linkish", type: "button", onclick: () => el.replaceWith(composer(ctx, null, "Save", c)) },
+          "Edit",
+        )
+      : null,
+    (c.mine || S.tl.access === "owner") && !c.deleted
+      ? h(
+          "button",
+          {
+            class: "linkish danger",
+            type: "button",
+            onclick: async () =>
+              confirm("Remove this comment?") && (await api("DELETE", `/api/comments/${c.id}`), redraw()),
+          },
+          "Remove",
+        )
+      : null,
+  );
   el.append(
     h(
       "div",
       { class: "by" },
-      h("b", {}, c.author.name),
+      h("b", {}, c.mine ? "You" : c.author.name),
       h("span", { class: "t", title: c.createdAt }, ago(c.createdAt), c.editedAt ? " · edited" : ""),
-      may && top && !c.deleted
-        ? h(
-            "button",
-            {
-              class: "linkish",
-              onclick: async () => (
-                await api("PATCH", `/api/comments/${c.id}`, { resolved: !c.resolvedAt }), redraw()
-              ),
-            },
-            c.resolvedAt ? "Reopen" : "Resolve",
-          )
-        : null,
-      c.mine && !c.deleted
-        ? h(
-            "button",
-            {
-              class: "linkish",
-              onclick: () => {
-                const f = composer(entryId, null, box, "Save", c);
-                el.replaceWith(f);
-              },
-            },
-            "Edit",
-          )
-        : null,
-      (c.mine || S.tl.access === "owner") && !c.deleted
-        ? h(
-            "button",
-            {
-              class: "linkish danger",
-              onclick: async () =>
-                confirm("Remove this comment?") && (await api("DELETE", `/api/comments/${c.id}`), redraw()),
-            },
-            "Remove",
-          )
-        : null,
     ),
-    c.deleted
-      ? h("p", { class: "muted", style: "font-size:13px" }, "Removed.")
-      : h("div", { class: "md", html: c.bodyHtml }),
+    c.deleted ? h("p", { class: "muted gone" }, "Removed.") : h("div", { class: "md", html: c.bodyHtml }),
+    acts.children.length ? acts : null,
   );
   return el;
 }
 
-function replyButton(entryId, parentId, box) {
+function replyButton(ctx, parentId) {
   const b = h(
     "button",
     {
-      class: "linkish",
-      style: "justify-self:start",
-      onclick: () => b.replaceWith(composer(entryId, parentId, box, "Reply")),
+      class: "linkish reply",
+      type: "button",
+      onclick: () => {
+        const f = composer(ctx, parentId, "Reply");
+        b.replaceWith(f);
+        f.querySelector("textarea").focus();
+      },
     },
     "Reply",
   );
   return b;
 }
 
-function composer(entryId, parentId, box, verb, editing) {
+function composer(ctx, parentId, verb, editing) {
   const ta = h("textarea", {
     placeholder: parentId
       ? "Your reply"
-      : "A question, an answer, a correction… Markdown works; @username mentions someone.",
+      : editing
+        ? ""
+        : "Write a comment. Markdown works; @username mentions someone.",
     required: true,
+    rows: 2,
+    "aria-label": parentId ? "Your reply" : editing ? "Your comment" : "A new thread",
   });
   if (editing) ta.value = editing.body || "";
   const err = h("span", { class: "error" });
-  const users = (S.dir?.users || []).map((u) => `@${u.username}`).join(" ");
   const f = h(
     "form",
-    { class: "composer" },
+    { class: `composer${parentId ? " inline" : ""}` },
     ta,
     h(
       "div",
       { class: "row" },
       h("button", { class: "button small", type: "submit" }, verb),
       editing || parentId
-        ? h(
-            "button",
-            { class: "linkish", type: "button", onclick: () => drawThreads(entryId, box) },
-            "Cancel",
-          )
-        : null,
-      users ? h("span", {}, `People: ${users}`) : null,
+        ? h("button", { class: "linkish", type: "button", onclick: () => drawThreads(ctx) }, "Cancel")
+        : h("span", {}, "Ctrl+Enter sends"),
       err,
     ),
   );
+  ta.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+      ev.preventDefault();
+      f.requestSubmit();
+    }
+  });
   f.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     try {
       if (editing) await api("PATCH", `/api/comments/${editing.id}`, { body: ta.value });
-      else await api("POST", `/api/entries/${entryId}/comments`, { body: ta.value, parentId });
-      await drawThreads(entryId, box);
-      refreshCounts();
+      else await api("POST", `/api/entries/${ctx.entryId}/comments`, { body: ta.value, parentId });
+      await drawThreads(ctx);
+      refreshCounts(ctx.entryId);
     } catch (e) {
       err.textContent = e.message;
     }
@@ -1145,22 +1408,12 @@ function composer(entryId, parentId, box, verb, editing) {
   return f;
 }
 
-async function refreshCounts() {
-  const data = await api("GET", `/api/timelines/${S.tl.slug}`).catch(() => null);
-  if (!data) return;
-  for (const e of data.entries) {
-    const cur = S.byId.get(e.id);
-    if (cur) Object.assign(cur, { comments: e.comments, openThreads: e.openThreads });
-  }
-  for (const id of S.open) {
-    const el = document.getElementById(`e${id}`);
-    const e = S.byId.get(id);
-    const meta = el?.querySelector(".meta .c");
-    if (meta)
-      meta.textContent = e.comments
-        ? `${e.comments} comment${e.comments > 1 ? "s" : ""}${e.openThreads ? `, ${e.openThreads} open` : ""}`
-        : "";
-  }
+async function refreshCounts(id) {
+  const fresh = await api("GET", `/api/entries/${id}`).catch(() => null);
+  const e = S.byId.get(id);
+  if (!fresh || !e) return;
+  Object.assign(e, { comments: fresh.comments, openThreads: fresh.openThreads });
+  document.querySelector(`#e${id} > .meta`)?.replaceWith(metaEl(e));
 }
 
 function refresh() {
@@ -1347,14 +1600,16 @@ function editEntry(e) {
     } else {
       const r = await api("POST", `/api/timelines/${S.tl.slug}/entries`, payload);
       S.open.add(r.id);
+      S.active = r.id;
       history.replaceState(null, "", `#e${r.id}`);
     }
     await refresh();
   });
 }
 
-function linkDialog(e) {
-  const others = S.entries.filter((x) => x.id !== e.id);
+async function linkDialog(e) {
+  const all = await api("GET", `/api/timelines/${S.tl.slug}/entries?brief=1`).catch(() => ({ entries: [] }));
+  const others = all.entries.filter((x) => x.id !== e.id);
   const list = h(
     "datalist",
     { id: "entry-list" },

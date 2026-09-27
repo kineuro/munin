@@ -126,7 +126,8 @@ Every door but `/health` and `/api/me` needs a session. Changing doors need `Con
 |---|---|
 | `GET /api/me` | Who is signed in, and the sign-in mode |
 | `GET /api/timelines`, `POST /api/timelines` | The timelines you may see; create one |
-| `GET`, `PATCH`, `DELETE /api/timelines/:slug` | One timeline with its entries and links; change it; delete it |
+| `GET`, `PATCH`, `DELETE /api/timelines/:slug` | One timeline with its entries, links and filter counts (`?entries=none` leaves the entries out); change it; delete it |
+| `GET /api/timelines/:slug/entries` | The entries a week at a time, newest first: the latest week with matches, then `?before=` the returned `next` until it is null. Filters: `types`, `record`, `tag`, `from`, `to`, `q`, `threads=1`, `stale=1`; `until=<entry id>` or `through=<date>` stretch one answer down to that week; `brief=1` lists every entry's id, type, title and date |
 | `PUT /api/timelines/:slug/grants` | Who may view, comment or edit |
 | `GET /api/timelines/:slug/search?q=` | Entries whose text holds the words |
 | `POST /api/timelines/:slug/entries` | Add an entry |
