@@ -110,6 +110,21 @@ The rules an import keeps:
 - The big picture it writes stays until someone edits it in the page.
 - Anything that looks like a personal identity number, a DICOM UID, an e-mail address, a subject label, a long hash or a path where data lives is replaced before it is stored, and the report counts the replacements.
 
+A project can add rules of its own for names it keeps out of a shared timeline, such as its machines, its internal addresses or the tools it does not name. The manifest's `redact` holds them inline, or names a JSON file beside it (a list, or `{ "rules": [...] }`), so the names stay out of the manifest's own repository:
+
+```json
+{ "redact": "redact.json", "timeline": { "slug": "demo", "title": "Demo" }, "sources": [] }
+```
+
+```json
+{ "rules": [
+  { "name": "machine", "pattern": "\\b(?:alpha|beta)-box\\b", "flags": "i", "to": "a group machine" },
+  { "name": "tool", "pattern": "\\bToolX\\b", "to": "tool-1" }
+] }
+```
+
+Each rule is a JavaScript regular expression (`g` is always added), run after the built-in ones on every text an import stores, links excepted. The report counts replacements per rule (`redactionsByRule`). Adding a rule cleans what earlier imports stored at the next run, except entries someone edited in the page and comments, which stay as their authors wrote them.
+
 ## Backups
 
 The database is one SQLite file in WAL mode. Copy it with SQLite's own backup, not with `cp`, while Munin runs:
