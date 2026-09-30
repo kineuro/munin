@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type DB, openDb } from "../src/db.js";
-import { type Manifest, runImport } from "../src/import.js";
+import { loadManifest, type Manifest, runImport } from "../src/import.js";
 
 let dir: string;
 let db: DB;
@@ -124,6 +124,41 @@ describe("import", () => {
       .join("\n");
     expect(all).not.toContain("/data/source");
     expect(all).not.toContain("A1B2");
+  });
+
+  it("runs the manifest's own redact rules from a file, and cleans what an earlier import stored", async () => {
+    const m = fixture();
+    await runImport(db, m);
+    const edited = (db.prepare("SELECT id FROM entries WHERE source_key = 'hand:q1'").get() as { id: number })
+      .id;
+    db.prepare("UPDATE entries SET title = 'Who pays Alex?', by_hand = 1 WHERE id = ?").run(edited);
+    writeFileSync(
+      join(dir, "rules.json"),
+      JSON.stringify({ rules: [{ name: "person", pattern: "\\bAlex\\b", to: "person-1" }] }),
+    );
+    writeFileSync(join(dir, "sources.json"), JSON.stringify({ ...m, redact: "rules.json" }));
+    const r = await runImport(db, loadManifest(join(dir, "sources.json")));
+    expect(r.redactionsByRule.person).toBeGreaterThan(0);
+    expect(r.updated).toBeGreaterThan(0);
+    const all = (
+      db
+        .prepare("SELECT title || summary || body_md || fields_json AS t FROM entries WHERE by_hand = 0")
+        .all() as {
+        t: string;
+      }[]
+    )
+      .map((x) => x.t)
+      .join("\n");
+    expect(all).not.toContain("Alex");
+    expect(all).toContain("person-1");
+    const t = db.prepare("SELECT waiting_md FROM timelines WHERE slug = 'demo'").get() as {
+      waiting_md: string;
+    };
+    expect(t.waiting_md).toBe("person-1");
+    // an entry edited in the page is left as the person wrote it
+    expect(
+      (db.prepare("SELECT title FROM entries WHERE id = ?").get(edited) as { title: string }).title,
+    ).toBe("Who pays Alex?");
   });
 
   it("is idempotent, keeps hand edits and comments, and marks what left its source", async () => {

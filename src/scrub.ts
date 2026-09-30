@@ -1,10 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // What an import may never carry. A timeline holds decisions, counts and links; anything that looks like a person's
 // identifier or a place where data lives is replaced before it is written, and counted so the import says so.
+// A manifest can add rules of its own (`redact`), for the names a project keeps to itself: its machines, its
+// addresses, the tools it does not name. They run after the built-in ones.
 
-interface Rule {
+export interface Rule {
   name: string;
   re: RegExp;
+  to: string;
+}
+
+/** A rule as a manifest writes it: a regular expression, its flags and what replaces a match. */
+export interface RedactRule {
+  name?: string;
+  pattern: string;
+  /** Regular expression flags; `g` is always added. */
+  flags?: string;
   to: string;
 }
 
@@ -33,35 +44,61 @@ const RULES: Rule[] = [
   { name: "home path", re: /(?<![\w.-])\/home\/[^\s`'")\]|,;]+/g, to: "[path]" },
 ];
 
+/** Checks and compiles a manifest's own rules; a bad one stops the import with its name. */
+export function compileRules(specs: RedactRule[] | undefined): Rule[] {
+  return (specs ?? []).map((r, i) => {
+    const name = r.name ?? `rule ${i + 1}`;
+    if (typeof r.pattern !== "string" || !r.pattern || typeof r.to !== "string")
+      throw new Error(`redact ${name}: needs a pattern and a replacement`);
+    const flags = r.flags ?? "";
+    if (!/^[imsuy]*g?[imsuy]*$/.test(flags)) throw new Error(`redact ${name}: unknown flags ${flags}`);
+    try {
+      return { name, re: new RegExp(r.pattern, flags.includes("g") ? flags : `${flags}g`), to: r.to };
+    } catch (e) {
+      throw new Error(`redact ${name}: ${(e as Error).message}`);
+    }
+  });
+}
+
 export interface ScrubResult {
   text: string;
   redactions: number;
+  byRule: Record<string, number>;
 }
 
-export function scrub(text: string): ScrubResult {
+export function scrub(text: string, extra: Rule[] = []): ScrubResult {
   let redactions = 0;
+  const byRule: Record<string, number> = {};
   let out = text;
-  for (const rule of RULES) {
+  for (const rule of [...RULES, ...extra]) {
     out = out.replace(rule.re, () => {
       redactions++;
+      byRule[rule.name] = (byRule[rule.name] ?? 0) + 1;
       return rule.to;
     });
   }
-  return { text: out, redactions };
+  return { text: out, redactions, byRule };
 }
 
-/** Scrubs every string inside a JSON-shaped value. */
-export function scrubDeep<T>(value: T, counter: { n: number }): T {
+export interface ScrubCounter {
+  n: number;
+  byRule?: Record<string, number>;
+}
+
+/** Scrubs every string inside a JSON-shaped value; links (`url`, `href`) are left as they are. */
+export function scrubDeep<T>(value: T, counter: ScrubCounter, extra: Rule[] = []): T {
   if (typeof value === "string") {
-    const r = scrub(value);
+    const r = scrub(value, extra);
     counter.n += r.redactions;
+    if (counter.byRule)
+      for (const [k, v] of Object.entries(r.byRule)) counter.byRule[k] = (counter.byRule[k] ?? 0) + v;
     return r.text as T;
   }
-  if (Array.isArray(value)) return value.map((v) => scrubDeep(v, counter)) as T;
+  if (Array.isArray(value)) return value.map((v) => scrubDeep(v, counter, extra)) as T;
   if (value && typeof value === "object") {
     const o: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value))
-      o[k] = k === "url" || k === "href" ? v : scrubDeep(v, counter);
+      o[k] = k === "url" || k === "href" ? v : scrubDeep(v, counter, extra);
     return o as T;
   }
   return value;

@@ -14,7 +14,7 @@ import { type HistorySource, readHistory } from "./importers/history.js";
 import { type ReleasesSource, readReleases } from "./importers/releases.js";
 import { readStudies, type StudiesSource } from "./importers/studies.js";
 import type { ImportedEntry, Picture, SourceOutput } from "./importers/types.js";
-import { scrubDeep } from "./scrub.js";
+import { compileRules, type RedactRule, scrubDeep } from "./scrub.js";
 
 export type Source =
   | AdrSource
@@ -28,6 +28,8 @@ export type Source =
 export interface Manifest {
   timeline: { slug: string; title: string; summary?: string; owner?: string };
   sources: Source[];
+  /** Rules of the project's own, run after the built-in ones: inline, or a JSON file (`[...]` or `{ "rules": [...] }`). */
+  redact?: RedactRule[] | string;
 }
 
 export interface ImportReport {
@@ -38,6 +40,8 @@ export interface ImportReport {
   kept: number;
   stale: number;
   redactions: number;
+  /** Replacements per rule, built-in and the manifest's own. */
+  redactionsByRule: Record<string, number>;
   links: number;
   unresolved: string[];
   warnings: string[];
@@ -60,6 +64,11 @@ export function loadManifest(path: string): Manifest {
     if (s.kind === "releases" && s.files)
       for (const k of Object.keys(s.files)) s.files[k] = fix(s.files[k] as string);
   }
+  if (typeof m.redact === "string") {
+    const r = JSON.parse(readFileSync(fix(m.redact), "utf8")) as RedactRule[] | { rules: RedactRule[] };
+    m.redact = Array.isArray(r) ? r : r.rules;
+  }
+  compileRules(m.redact as RedactRule[] | undefined);
   return m;
 }
 
@@ -108,7 +117,9 @@ function hashOf(e: ImportedEntry): string {
 }
 
 export function applyImport(db: DB, manifest: Manifest, data: SourceOutput): ImportReport {
-  const counter = { n: 0 };
+  if (typeof manifest.redact === "string") throw new Error("redact: load the manifest with loadManifest");
+  const extra = compileRules(manifest.redact);
+  const counter = { n: 0, byRule: {} as Record<string, number> };
   const seen = new Map<string, ImportedEntry>();
   const warnings = [...data.warnings];
   for (const e of data.entries) {
@@ -120,11 +131,11 @@ export function applyImport(db: DB, manifest: Manifest, data: SourceOutput): Imp
     const merged: ImportedEntry = o
       ? { ...e, ...o, fields: { ...(e.fields ?? {}), ...(o.fields ?? {}) } }
       : e;
-    seen.set(e.key, scrubDeep(merged, counter));
+    seen.set(e.key, scrubDeep(merged, counter, extra));
   }
   for (const k of Object.keys(data.overrides ?? {}))
     if (!seen.has(k)) warnings.push(`override for ${k}: no such entry`);
-  const picture: Picture | undefined = data.picture ? scrubDeep(data.picture, counter) : undefined;
+  const picture: Picture | undefined = data.picture ? scrubDeep(data.picture, counter, extra) : undefined;
 
   const report: ImportReport = {
     timeline: manifest.timeline.slug,
@@ -134,6 +145,7 @@ export function applyImport(db: DB, manifest: Manifest, data: SourceOutput): Imp
     kept: 0,
     stale: 0,
     redactions: counter.n,
+    redactionsByRule: counter.byRule,
     links: 0,
     unresolved: [],
     warnings,

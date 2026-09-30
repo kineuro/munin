@@ -6,6 +6,7 @@
 - The big picture opens folded to its first lines; unfolding it is remembered in the browser.
 - A click or tap anywhere on an entry opens it, not only its title.
 - The active entry's threads show as chat bubbles in a pane beside the timeline (under the entry on a phone), replies indented, the box to write at the bottom.
+- An import manifest can carry redact rules of its own (`redact`, inline or a JSON file beside it): a pattern and its replacement, run after the built-in ones and counted per rule in the report.
 
 ## 0.1.0
 
