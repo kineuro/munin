@@ -66,6 +66,8 @@ export function loadManifest(path: string): Manifest {
   }
   if (typeof m.redact === "string") {
     const r = JSON.parse(readFileSync(fix(m.redact), "utf8")) as RedactRule[] | { rules: RedactRule[] };
+    if (!Array.isArray(r) && !Array.isArray(r?.rules))
+      throw new Error(`redact: ${m.redact} holds no list of rules`);
     m.redact = Array.isArray(r) ? r : r.rules;
   }
   compileRules(m.redact as RedactRule[] | undefined);
